@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Indodax Paper Scanner</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, Segoe UI, sans-serif; background: #10151c; color: #e8edf3; }
+    body { margin: 0; }
+    header { padding: 22px 4vw; background: #18212b; border-bottom: 1px solid #2a3745; display: flex; justify-content: space-between; gap: 18px; align-items: center; flex-wrap: wrap; }
+    h1 { margin: 0 0 5px; font-size: 23px; }
+    .subtle, small { color: #9eacba; }
+    main { padding: 22px 4vw 50px; max-width: 1500px; margin: auto; }
+    .notice { background: #392b10; color: #ffda84; padding: 12px 15px; border: 1px solid #6c521c; border-radius: 8px; margin-bottom: 18px; }
+    .error { display: none; background: #421f25; color: #ffb9c1; padding: 12px 15px; border-radius: 8px; margin-bottom: 18px; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit,minmax(170px,1fr)); gap: 12px; margin-bottom: 20px; }
+    .card, section { background: #18212b; border: 1px solid #2a3745; border-radius: 9px; }
+    .card { padding: 15px; } .card span { display:block; font-size: 12px; color:#9eacba; margin-bottom: 8px; } .card strong { font-size: 19px; }
+    section { padding: 16px; margin: 14px 0; overflow-x: auto; }
+    h2 { font-size: 17px; margin: 0 0 14px; }
+    button { border: 0; border-radius: 6px; padding: 9px 13px; font-weight: 650; color: #06120d; background: #7ee0aa; cursor: pointer; }
+    button.secondary { background: #394b5e; color: #e8edf3; } button.danger { background: #ffb4b4; } button:disabled { opacity:.5; cursor: wait; }
+    .controls { display:flex; gap:9px; align-items:center; flex-wrap:wrap; }
+    table { border-collapse: collapse; width: 100%; min-width: 740px; font-size: 13px; }
+    th,td { text-align:left; border-bottom:1px solid #2a3745; padding:10px 8px; white-space:nowrap; }
+    th { color:#9eacba; font-weight:500; } .positive { color:#7ee0aa; } .negative { color:#ff9292; }
+    .badge { display:inline-block; padding:4px 7px; border-radius:20px; background:#263b32; color:#9cf2bf; font-size:11px; }
+    .badge.warn { background:#46351b; color:#ffda84; } .badge.muted { background:#293440; color:#b6c1cc; }
+    .form { display:flex; gap:10px; align-items:end; flex-wrap:wrap; } label { display:grid; gap:5px; font-size:12px; color:#aeb9c4; }
+    input,select { color:#e8edf3; background:#10151c; border:1px solid #394b5e; border-radius:5px; padding:9px; }
+    #dca-result { margin-top:12px; color:#b9c7d4; line-height:1.6; }
+    @media(max-width:600px) { header { align-items:flex-start; } main { padding:16px 3vw; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1>Indodax Paper Scanner</h1><div class="subtle">Pemantauan pasar IDR • simulasi saja • tidak mengirim order</div></div>
+    <div class="controls">
+      <button id="start" onclick="safePost('/api/scanner/start', {})">Mulai scanner</button>
+      <button class="secondary" onclick="safePost('/api/scanner/stop', {})">Hentikan scanner</button>
+      <label style="display:flex;align-items:center;gap:7px"><input id="auto-entry" type="checkbox" onchange="safePost('/api/paper/auto-entry',{enabled:this.checked})">Entry paper otomatis</label>
+    </div>
+  </header>
+  <main>
+    <div class="notice"><b>MODE PAPER ONLY.</b> Saldo dan posisi di dashboard adalah simulasi. Pemeriksaan private API bersifat read-only dan hanya lokal. Jika dashboard dibuka langsung melalui IP:port HTTP, koneksi tidak terenkripsi: gunakan sementara untuk paper mode saja dan jangan masukkan rahasia/API key.</div>
+    <div id="error" class="error"></div>
+    <section>
+      <h2>Preflight private API (read-only)</h2>
+      <div class="controls">
+        <button class="secondary" onclick="exchangePreflight()">Periksa koneksi API</button>
+        <small>Memeriksa saldo IDR, izin key, dan open orders. Tidak membuat atau membatalkan order.</small>
+      </div>
+      <div id="private-status" class="subtle" style="margin-top:12px">Belum diperiksa. API key hanya dibaca dari konfigurasi lokal.</div>
+    </section>
+    <div class="cards" id="balances"></div>
+    <section><h2>Posisi paper terbuka</h2><div id="positions"></div></section>
+    <section>
+      <h2>Simulasi DCA manual (tidak mengubah posisi)</h2>
+      <div class="form">
+        <label>Posisi<select id="dca-position"></select></label>
+        <label>Nominal IDR<input id="dca-amount" type="number" min="1" max="2500000" step="50000" value="500000"></label>
+        <label>Harga DCA<input id="dca-price" type="number" min="0.00000001" step="any"></label>
+        <button onclick="simulateDca()">Hitung simulasi</button>
+      </div>
+      <div id="dca-result"></div>
+    </section>
+    <section><h2>Scanner pasar IDR</h2><div class="subtle" id="scan-meta">Menunggu scanner dimulai.</div><div id="signals"></div></section>
+    <section><h2>Log audit paper</h2><div id="events"></div></section>
+  </main>
+<script>
+const idr = n => new Intl.NumberFormat('id-ID',{style:'currency',currency:'IDR',maximumFractionDigits:0}).format(Number(n||0));
+const pct = n => n == null ? '—' : `${Number(n).toFixed(2)}%`;
+const esc = s => String(s ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function post(url, body) {
+  const response = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Permintaan gagal');
+  await refresh();
+  return data;
+}
+async function safePost(url,body) { try { return await post(url,body); } catch(e) { showError(e.message); } }
+function showError(message) { const el=document.querySelector('#error'); el.textContent=message; el.style.display='block'; }
+function hideError() { document.querySelector('#error').style.display='none'; }
+async function refresh() {
+  try {
+    const response=await fetch('/api/state',{cache:'no-store'});
+    const state=await response.json();
+    if (!response.ok) throw new Error(state.error || 'Gagal memuat status');
+    hideError();
+    document.querySelector('#auto-entry').checked=state.auto_paper_entry;
+    document.querySelector('#scan-meta').textContent =
+      `${state.scanner_running?'Berjalan':'Berhenti'} • ${state.markets_scanned} pasar • Pemindaian terakhir: ${state.last_scan || 'belum ada'} • Interval ${state.scan_interval_seconds}s`;
+    if (state.error) showError(`Data scan bermasalah: ${state.error}. Entry paper tidak dibuat sampai pemindaian berhasil.`);
+    const b=state.balances;
+    const cards=[
+      ['Saldo virtual total',idr(b.virtual_total_idr)],
+      ['Kas trading paper',idr(b.trade_cash_idr)],
+      ['Kapasitas entry tersedia',idr(b.available_entry_capacity_idr)],
+      ['Dana DCA terkunci',idr(b.dca_reserve_locked_idr)],
+      ['Cadangan manual terkunci',idr(b.manual_reserve_locked_idr)],
+      ['Profit terkunci',idr(b.locked_profit_idr)],
+      ['BTC / ETH menunggu alokasi',`${idr(b.locked_btc_idr)} / ${idr(b.locked_eth_idr)}`]
+    ];
+    document.querySelector('#balances').innerHTML=cards.map(([k,v])=>`<div class="card"><span>${k}</span><strong>${v}</strong></div>`).join('');
+    const positions=state.positions.filter(p=>p.status!=='CLOSED');
+    document.querySelector('#positions').innerHTML=positions.length?`<table><thead><tr><th>Aset</th><th>Harga masuk</th><th>Harga kini</th><th>Kuantitas</th><th>P/L belum terealisasi</th><th>Status</th><th>TP</th><th>Aksi</th></tr></thead><tbody>${positions.map(p=>`<tr><td>${esc(p.symbol)}</td><td>${idr(p.average_price)}</td><td>${idr(p.current_price)}</td><td>${Number(p.quantity).toPrecision(8)}</td><td class="${p.unrealized_pnl_idr>=0?'positive':'negative'}">${idr(p.unrealized_pnl_idr)} (${pct(p.unrealized_pnl_percent)})</td><td><span class="badge ${p.under_review?'warn':''}">${esc(p.status)}</span></td><td>${p.tp_stage}/3</td><td><button class="danger" onclick="safePost('/api/paper/positions/${encodeURIComponent(p.id)}/sell',{})">Jual paper</button></td></tr>`).join('')}</tbody></table>`:'<small>Belum ada posisi paper terbuka.</small>';
+    document.querySelector('#dca-position').innerHTML=positions.map(p=>`<option value="${esc(p.id)}">${esc(p.symbol)} — ${idr(p.average_price)}</option>`).join('');
+    document.querySelector('#signals').innerHTML=state.signals.length?`<table><thead><tr><th>Aset</th><th>Harga</th><th>Spread</th><th>Volume 24j</th><th>1m</th><th>5m</th><th>15m</th><th>1j</th><th>4j</th><th>1d</th><th>EMA 15m</th><th>RSI 15m</th><th>ATR 15m</th><th>Rel. volume</th><th>Resistance 15m</th><th>Skor</th><th>Status</th></tr></thead><tbody>${state.signals.map(s=>{const t=s.technical||{};const m=t['15m']||{};const v=t['1m']||{};return `<tr title="${esc(s.technical_error||'')}"><td>${esc(s.symbol)}</td><td>${idr(s.price_idr)}</td><td>${pct(s.spread_percent)}</td><td>${idr(s.volume_idr_24h)}</td><td>${pct(s.changes_percent['1m'])}</td><td>${pct(s.changes_percent['5m'])}</td><td>${pct(s.changes_percent['15m'])}</td><td>${pct(s.changes_percent['1h'])}</td><td>${pct(s.changes_percent['4h'])}</td><td>${pct(s.changes_percent['1d'])}</td><td>${m.ema_bullish==null?'—':m.ema_bullish?'Bullish':'Bearish'}</td><td>${m.rsi_14==null?'—':Number(m.rsi_14).toFixed(1)}</td><td>${pct(m.atr_percent)}</td><td>${v.relative_volume==null?'—':Number(v.relative_volume).toFixed(2)+'x'}</td><td>${m.resistance_20==null?'—':idr(m.resistance_20)}</td><td>${s.score}</td><td><span class="badge ${s.status==='EARLY MOMENTUM'?'':'muted'}">${esc(s.status)}</span></td></tr>`;}).join('')}</tbody></table>`:'<small>Belum ada data. Mulai scanner untuk mengambil ticker publik Indodax.</small>';
+    document.querySelector('#events').innerHTML=state.events.length?`<table><thead><tr><th>Waktu UTC</th><th>Aset</th><th>Peristiwa</th><th>Detail</th></tr></thead><tbody>${state.events.map(e=>`<tr><td>${esc(e.created_at)}</td><td>${esc(e.symbol||'—')}</td><td>${esc(e.event_type)}</td><td>${esc(JSON.stringify(e.detail))}</td></tr>`).join('')}</tbody></table>`:'<small>Belum ada aktivitas.</small>';
+  } catch(e) { showError(e.message); }
+}
+async function simulateDca() {
+  const position_id=document.querySelector('#dca-position').value;
+  const amount_idr=Number(document.querySelector('#dca-amount').value);
+  const price_idr=Number(document.querySelector('#dca-price').value);
+  try {
+    const data=await post('/api/dca/simulate',{position_id,amount_idr,price_idr});
+    document.querySelector('#dca-result').innerHTML=
+      `${esc(data.note)}<br>Rata-rata baru: ${idr(data.new_average_price)} • Titik impas setelah biaya: ${idr(data.break_even_after_fees)}<br>`+
+      `Estimasi modal total: ${idr(data.estimated_total_cost_idr)} • Biaya simulasi: ${idr(data.simulated_dca_fee_idr)}<br>`+
+      `P/L jika turun 10% dari titik impas: ${idr(data.loss_if_price_falls_10_percent_idr)} • Sisa cadangan: ${idr(data.dca_reserve_remaining_idr)}`;
+  } catch(e) { showError(e.message); }
+}
+async function exchangePreflight() {
+  const target=document.querySelector('#private-status');
+  target.textContent='Memeriksa API Indodax dengan akses read-only...';
+  try {
+    const data=await post('/api/exchange/preflight',{});
+    const safe=data.permissions_safe_for_trading;
+    target.innerHTML=`<span class="badge ${safe?'':'warn'}">${safe?'Koneksi dan izin dasar terverifikasi':'Izin key perlu diperbaiki'}</span><br>`+
+      `Izin spot trade: ${data.trade_permission?'aktif':'tidak aktif'} • Withdraw crypto: ${data.crypto_withdrawals_disabled?'nonaktif':'aktif — jangan gunakan key ini'} • Withdraw IDR: ${data.idr_withdrawals_disabled?'nonaktif':'aktif — jangan gunakan key ini'}<br>`+
+      `IDR tersedia: ${idr(data.idr_available)} • IDR terkunci: ${idr(data.idr_locked)} • Open order akun: ${data.open_order_count}<br>`+
+      `${esc(data.message)}<br><small>${data.open_orders.map(o=>`${esc(o.symbol)} ${esc(o.side)} ${esc(o.status)} (${esc(o.executedQty)}/${esc(o.origQty)})`).join('<br>') || 'Tidak ada open order.'}</small>`;
+  } catch(e) {
+    target.textContent=e.message;
+  }
+}
+refresh(); setInterval(refresh,5000);
+</script>
+</body>
+</html>

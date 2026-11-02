@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+paper_trading.sqlite3
+paper_trading.sqlite3-shm
+paper_trading.sqlite3-wal
+__pycache__/
+*.py[cod]

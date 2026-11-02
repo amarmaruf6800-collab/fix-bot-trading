@@ -1,0 +1,31 @@
+[Unit]
+Description=Indodax Paper Trading Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=indodaxbot
+Group=indodaxbot
+WorkingDirectory=/opt/indodax-bot
+EnvironmentFile=/etc/indodax-bot.env
+ExecStart=/opt/indodax-bot/.venv/bin/python /opt/indodax-bot/bot.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+StateDirectory=indodax-bot
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/indodax-bot
+
+[Install]
+WantedBy=multi-user.target
