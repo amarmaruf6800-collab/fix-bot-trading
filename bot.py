@@ -1237,7 +1237,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "IndodaxPaperDashboard/1.0"
     sys_version = ""
 
-    def _send(self, status: int, payload: bytes, content_type: str) -> None:
+    def _send(
+        self,
+        status: int,
+        payload: bytes,
+        content_type: str,
+        *,
+        head_only: bool = False,
+    ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
@@ -1245,7 +1252,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.end_headers()
-        self.wfile.write(payload)
+        if not head_only:
+            self.wfile.write(payload)
 
     def _json(self, status: int, payload: Any) -> None:
         self._send(
@@ -1266,6 +1274,32 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(200, SERVICE.state())
             return
         self._json(404, {"error": "Not found"})
+
+    def do_HEAD(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/":
+            try:
+                content = INDEX_FILE.read_bytes()
+                self._send(
+                    200,
+                    content,
+                    "text/html; charset=utf-8",
+                    head_only=True,
+                )
+            except OSError:
+                self._send(
+                    500,
+                    b"",
+                    "application/json; charset=utf-8",
+                    head_only=True,
+                )
+            return
+        self._send(
+            404,
+            b"",
+            "application/json; charset=utf-8",
+            head_only=True,
+        )
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)

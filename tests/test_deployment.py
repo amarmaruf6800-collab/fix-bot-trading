@@ -89,6 +89,29 @@ class DeploymentTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
+    def test_dashboard_supports_head_request_for_health_checks(self) -> None:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardHandler)
+        host, port = server.server_address
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = urllib.request.Request(
+                f"http://{host}:{port}/",
+                method="HEAD",
+            )
+            with urllib.request.urlopen(request, timeout=2) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers.get_content_type(), "text/html")
+                self.assertEqual(response.read(), b"")
+                self.assertGreater(
+                    int(response.headers["Content-Length"]),
+                    0,
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
 
 if __name__ == "__main__":
     unittest.main()
