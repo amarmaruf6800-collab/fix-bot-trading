@@ -29,7 +29,7 @@ DATABASE = DATA_DIRECTORY / "paper_trading.sqlite3"
 INDEX_FILE = ROOT / "dashboard.html"
 API_BASE = "https://indodax.com/api"
 BOT_HOST = os.environ.get("BOT_HOST", "127.0.0.1").strip()
-BOT_PORT = int(os.environ.get("BOT_PORT", "8000"))
+BOT_PORT = int(os.environ.get("BOT_PORT", "8765"))
 BOT_ALLOWED_HOST = os.environ.get(
     "BOT_ALLOWED_HOST",
     f"{'127.0.0.1' if BOT_HOST in {'127.0.0.1', '::1', 'localhost'} else BOT_HOST}:{BOT_PORT}",

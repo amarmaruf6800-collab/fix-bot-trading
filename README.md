@@ -6,7 +6,7 @@ Dashboard lokal Python untuk memindai pasangan IDR, menganalisis OHLC multi-time
 
 1. Pastikan Python 3.10 atau lebih baru tersedia.
 2. Dari folder project, jalankan `python bot.py`.
-3. Buka `http://127.0.0.1:8000`.
+3. Buka `http://127.0.0.1:8765`.
 4. Pilih **Mulai scanner**. Pemindaian dilakukan setiap 30 detik.
 
 Dependensi runtime hanya standard library Python. Ledger paper disimpan lokal di `paper_trading.sqlite3`.
@@ -15,47 +15,48 @@ Host dan port bisa dikonfigurasi dengan `BOT_HOST`, `BOT_PORT`, dan `BOT_ALLOWED
 
 ## VPS Biznet Gio tanpa Nginx (paper mode sementara)
 
-Konfigurasi systemd dan environment contoh tersedia di folder `deploy/`. Jalur ini membuat aplikasi Python melayani dashboard langsung pada `http://IP-VPS:8000`; **tidak memakai Vercel atau Nginx**.
+Konfigurasi systemd dan environment contoh tersedia di folder `deploy/`. Jalur ini membuat aplikasi Python melayani dashboard langsung pada `http://IP-VPS:8765`; **tidak memakai Vercel atau Nginx**.
 
-> **Peringatan:** IP:port HTTP tidak mengenkripsi lalu lintas. Gunakan hanya sementara untuk paper mode, jangan masukkan API key/secret, dan batasi akses port 8000 ke IP Anda melalui firewall/security group Biznet Gio. Private API preflight otomatis ditolak untuk koneksi non-lokal.
+> **Peringatan:** IP:port HTTP tidak mengenkripsi lalu lintas dan dashboard ini belum memakai login. Gunakan hanya sementara untuk paper mode, jangan masukkan API key/secret, dan tutup kembali akses publik setelah selesai. Private API preflight otomatis ditolak untuk koneksi non-lokal.
 
-Asumsi: Ubuntu/Debian, repository GitHub sudah dibuat, dan SSH ke VPS berfungsi.
+Asumsi: Ubuntu/Debian, repository GitHub sudah dibuat, dan SSH ke VPS berfungsi. Contoh di bawah ini mengikuti folder `/var/www/fix-bot-trading` yang digunakan saat clone.
 
 1. Siapkan host:
 
    ```bash
    sudo apt update
    sudo apt install -y git python3 python3-venv
-   sudo adduser --system --group --home /opt/indodax-bot indodaxbot
-   sudo mkdir -p /opt/indodax-bot
-   sudo chown indodaxbot:indodaxbot /opt/indodax-bot
+   sudo id indodaxbot >/dev/null 2>&1 || sudo useradd --system --user-group --create-home --home-dir /var/lib/indodax-bot --shell /usr/sbin/nologin indodaxbot
+   sudo mkdir -p /var/www/fix-bot-trading
+   sudo chown -R indodaxbot:indodaxbot /var/www/fix-bot-trading
    ```
 
 2. Clone repository private dengan deploy key GitHub yang hanya memiliki akses baca:
 
    ```bash
-   sudo -u indodaxbot git clone git@github.com:USERNAME/fix-bot-trading.git /opt/indodax-bot
-   sudo -u indodaxbot python3 -m venv /opt/indodax-bot/.venv
-   sudo -u indodaxbot /opt/indodax-bot/.venv/bin/python -m unittest discover -s /opt/indodax-bot/tests -v
+   # Repository sudah di-clone? Gunakan folder itu; jangan clone ulang ke dalamnya.
+   sudo -u indodaxbot git -C /var/www/fix-bot-trading remote -v
+   sudo -u indodaxbot python3 -m venv /var/www/fix-bot-trading/.venv
+   sudo -u indodaxbot /var/www/fix-bot-trading/.venv/bin/python -m unittest discover -s /var/www/fix-bot-trading/tests -v
    ```
 
 3. Siapkan konfigurasi service. Ganti `YOUR_VPS_PUBLIC_IP` dengan IP publik VPS yang sebenarnya:
 
    ```bash
-   sudo cp /opt/indodax-bot/deploy/indodax-bot.env.example /etc/indodax-bot.env
+   sudo cp /var/www/fix-bot-trading/deploy/indodax-bot.env.example /etc/indodax-bot.env
    sudo nano /etc/indodax-bot.env
    sudo chmod 600 /etc/indodax-bot.env
-   sudo cp /opt/indodax-bot/deploy/indodax-bot.service /etc/systemd/system/indodax-bot.service
+   sudo cp /var/www/fix-bot-trading/deploy/indodax-bot.service /etc/systemd/system/indodax-bot.service
    sudo systemctl daemon-reload
    sudo systemctl enable --now indodax-bot
    sudo systemctl status indodax-bot
    ```
 
-4. Di pengaturan firewall/security group Biznet Gio, izinkan TCP port `8000` **hanya dari IP publik Anda**. Jangan membuka port tersebut ke seluruh internet. Setelah itu buka `http://YOUR_VPS_PUBLIC_IP:8000`.
+4. Pastikan port `8765` belum dipakai (`sudo ss -ltnp | grep ':8765'`). Di firewall/security group Biznet Gio, buka TCP port `8765` hanya selama dibutuhkan. Pilihan paling aman adalah hanya mengizinkan IP publik Anda. Jika memang ingin dashboard sementara dapat dibuka siapa saja, sumber `0.0.0.0/0` akan mempublikasikannya tanpa login melalui HTTP—lakukan hanya untuk paper mode dan tutup kembali segera setelah selesai. Lalu buka `http://YOUR_VPS_PUBLIC_IP:8765`.
 
 Log service: `sudo journalctl -u indodax-bot -f`. Menghentikan service: `sudo systemctl disable --now indodax-bot`.
 
-Jika repository berubah, jalankan `sudo -u indodaxbot git -C /opt/indodax-bot pull --ff-only`, kemudian `sudo systemctl restart indodax-bot`. Jangan menaruh `.env` lokal, API key, secret, token GitHub, atau database paper di GitHub.
+Jika repository berubah, jalankan `sudo -u indodaxbot git -C /var/www/fix-bot-trading pull --ff-only`, kemudian `sudo systemctl restart indodax-bot`. Jangan menaruh `.env` lokal, API key, secret, token GitHub, atau database paper di GitHub.
 
 ## Scanner dan analisis
 

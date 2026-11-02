@@ -4,12 +4,24 @@ import unittest
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 from unittest.mock import patch
 
-from bot import DashboardHandler, is_loopback_client
+from bot import BOT_PORT, DashboardHandler, is_loopback_client
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_default_and_vps_ports_are_not_common_conflicting_ports(self) -> None:
+        self.assertEqual(BOT_PORT, 8765)
+        env_example = (
+            Path(__file__).resolve().parents[1]
+            / "deploy"
+            / "indodax-bot.env.example"
+        ).read_text(encoding="utf-8")
+        self.assertIn("BOT_PORT=8765", env_example)
+        self.assertNotIn("8000", env_example)
+        self.assertNotIn("8080", env_example)
+
     def test_loopback_address_check(self) -> None:
         self.assertTrue(is_loopback_client("127.0.0.1"))
         self.assertTrue(is_loopback_client("::1"))
