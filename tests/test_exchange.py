@@ -1,11 +1,14 @@
 import hashlib
 import hmac
 import json
+import sys
 import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from exchange import (
     IndodaxApiError,

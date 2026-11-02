@@ -37,7 +37,7 @@ Asumsi: Ubuntu/Debian, repository GitHub sudah dibuat, dan SSH ke VPS berfungsi.
    # Repository sudah di-clone? Gunakan folder itu; jangan clone ulang ke dalamnya.
    sudo -u indodaxbot git -C /var/www/fix-bot-trading remote -v
    sudo -u indodaxbot python3 -m venv /var/www/fix-bot-trading/.venv
-   sudo -u indodaxbot /var/www/fix-bot-trading/.venv/bin/python -m unittest discover -s /var/www/fix-bot-trading/tests -v
+   sudo -u indodaxbot sh -c 'cd /var/www/fix-bot-trading && .venv/bin/python -m unittest discover -s tests -v'
    ```
 
 3. Siapkan konfigurasi service. Ganti `YOUR_VPS_PUBLIC_IP` dengan IP publik VPS yang sebenarnya:

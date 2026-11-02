@@ -1,8 +1,11 @@
 import tempfile
+import sys
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from exchange import IndodaxCredentials
 

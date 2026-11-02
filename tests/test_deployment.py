@@ -1,4 +1,5 @@
 import json
+import sys
 import threading
 import unittest
 import urllib.error
@@ -6,6 +7,8 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bot import BOT_PORT, DashboardHandler, is_loopback_client
 
