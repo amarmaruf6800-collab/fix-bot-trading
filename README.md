@@ -52,7 +52,18 @@ Asumsi: Ubuntu/Debian, repository GitHub sudah dibuat, dan SSH ke VPS berfungsi.
    sudo systemctl status indodax-bot
    ```
 
-4. Pastikan port `8765` belum dipakai (`sudo ss -ltnp | grep ':8765'`). Di firewall/security group Biznet Gio, buka TCP port `8765` hanya selama dibutuhkan. Pilihan paling aman adalah hanya mengizinkan IP publik Anda. Jika memang ingin dashboard sementara dapat dibuka siapa saja, sumber `0.0.0.0/0` akan mempublikasikannya tanpa login melalui HTTP—lakukan hanya untuk paper mode dan tutup kembali segera setelah selesai. Lalu buka `http://YOUR_VPS_PUBLIC_IP:8765`.
+4. Pastikan aplikasi listen pada `0.0.0.0:8765` (`sudo ss -ltnp | grep ':8765'`). `BOT_ALLOWED_HOST` harus berisi IP publik VPS dan port, misalnya `103.58.101.236:8765`; ini memeriksa alamat tujuan, bukan membatasi IP perangkat yang membuka dashboard.
+
+   Agar bisa dibuka dari HP maupun perangkat lain tanpa mencocokkan IP sumber, izinkan port tersebut dari semua alamat di UFW VPS:
+
+   ```bash
+   sudo ufw allow 8765/tcp
+   sudo ufw status
+   ```
+
+   Di firewall/security group Biznet Gio, buat aturan inbound TCP port `8765` dengan sumber `0.0.0.0/0` (semua alamat IPv4). Jika memakai IPv6, tambahkan juga sumber `::/0`. Setelah itu buka `http://YOUR_VPS_PUBLIC_IP:8765` dari HP. Uji memakai data seluler atau Wi-Fi; alamat yang dipakai tetap IP VPS.
+
+   **Peringatan:** aturan ini mempublikasikan dashboard tanpa login dan tanpa enkripsi kepada siapa pun di internet. Aplikasi hanya paper trading, tetapi pengunjung dapat mengubah state paper atau menjalankan scanner. Gunakan hanya sementara untuk tes dan hapus aturan UFW serta aturan Biznet setelah selesai (`sudo ufw delete allow 8765/tcp`).
 
 Log service: `sudo journalctl -u indodax-bot -f`. Menghentikan service: `sudo systemctl disable --now indodax-bot`.
 
@@ -61,10 +72,12 @@ Jika repository berubah, jalankan `sudo -u indodaxbot git -C /var/www/fix-bot-tr
 ## Scanner dan analisis
 
 - Membaca seluruh pasangan IDR dan ticker publik Indodax; mengambil kandidat paling relevan untuk dianalisis lebih lanjut.
-- Mengambil histori candle resmi 1 menit, 15 menit, 1 jam, 4 jam, dan 1 hari untuk sampai enam kandidat per siklus. Ini menjaga jumlah permintaan di bawah batas publik 180 permintaan/menit yang didokumentasikan Indodax.
-- Menghitung perubahan harga jangka pendek, EMA 9/21, RSI 14, ATR, volume relatif, support/resistance 20 candle, ruang menuju resistance, dan indikasi false breakout.
-- Hanya kandidat dengan data OHLC memadai dan tanpa kondisi false breakout/resistance terlalu dekat yang dapat membuka posisi **paper**. Kegagalan data teknis membuat kandidat menunggu; bukan fallback ke entry tanpa verifikasi.
-- Memindai pasangan aktif, mengecualikan BTC, ETH, SOL, XRP, BNB, LINK, DOT, HYPE, AAVE, HBAR, ALGO, NEAR, dan ONDO, serta menerapkan batas harga Rp50, spread maksimum 1,5%, dan konteks volume 24 jam.
+- Mengambil histori candle resmi 15 menit, 1 jam, dan 4 jam untuk sampai enam kandidat per siklus. Strategi entry intraday memakai momentum candle 15m Indodax (tanpa menunggu 15 menit pengamatan lokal setelah restart), konfirmasi EMA 1h, dan tren EMA 4h.
+- Request data publik yang gagal sementara dicoba ulang maksimal tiga kali dengan jeda singkat. Jika tetap gagal, scanner menampilkan error dan tidak membuat entry dari data lama.
+- Menghitung perubahan harga 15m/1h/4h, EMA 9/21, RSI 14, ATR, volume relatif 15m, support/resistance 20 candle, ruang menuju resistance, dan indikasi false breakout.
+- Sebelum entry/DCA, memvalidasi ask terhadap last trade dan low/high 24 jam. Quote yang menyimpang lebih dari 1,5% atau berada di bawah low 24 jam ditolak untuk mencegah entry dari data ticker yang tidak konsisten.
+- Hanya kandidat dengan data OHLC memadai, momentum 15m, tren 1h/4h yang terkonfirmasi, dan tanpa kondisi false breakout/resistance terlalu dekat yang dapat membuka posisi **paper**. Kegagalan data teknis membuat kandidat menunggu; bukan fallback ke entry tanpa verifikasi.
+- Memindai pasangan aktif, mengecualikan BTC, ETH, SOL, XRP, BNB, LINK, DOT, HYPE, AAVE, HBAR, ALGO, NEAR, dan ONDO, serta membuang sepenuhnya aset berharga **Rp50 atau lebih rendah** dari daftar pantauan dan aksi beli/DCA. Spread maksimum 1,5% dan konteks volume 24 jam juga diterapkan.
 - API publik yang dipakai: [Indodax Public REST API](https://github.com/btcid/indodax-official-api-docs/blob/master/Public-RestAPI.md).
 
 Kriteria momentum awal adalah konfigurasi pengujian, bukan rekomendasi atau jaminan hasil. Histori candles tersedia dari exchange; perubahan ticker rolling lokal tetap memerlukan pengamatan scanner. Pola grafik/candle kompleks, berita proyek, risiko delisting, dan kedalaman order book belum menjadi bagian dari skor entry.
@@ -72,8 +85,11 @@ Kriteria momentum awal adalah konfigurasi pengujian, bukan rekomendasi atau jami
 ## Batas modal paper
 
 - Modal simulasi awal Rp10.000.000: kas trading virtual Rp8.000.000 dan cadangan manual Rp2.000.000.
-- Maksimal dua posisi, anggaran entry tetap Rp1.500.000 per posisi termasuk simulasi biaya 0,2%.
-- Cadangan DCA manual Rp2.500.000 per posisi tidak dapat dipakai untuk entry. Simulasi DCA hanya menghitung hasil dan tidak mengubah saldo/posisi.
+- Maksimal tiga posisi aktif: dua posisi otomatis dan satu posisi manual terpisah. Entry otomatis tetap Rp1.500.000 per posisi termasuk simulasi biaya 0,2%; satu siklus scan dapat membuka sampai jumlah slot otomatis yang tersedia jika sinyal valid mencukupi.
+- Cadangan DCA Rp2.500.000 per posisi (maksimal Rp5.000.000) dapat dipakai untuk DCA paper manual; jika nominal DCA melebihi saldo DCA yang tersedia, sisa diambil dari cadangan manual.
+- Cadangan manual awal Rp2.000.000 dapat dipakai untuk membuka posisi paper dengan nominal pilihan pengguna atau untuk DCA paper manual. Setiap penggunaan mengurangi saldo cadangan yang sama; penjualan mengembalikan hasil sesuai sumber modal posisi.
+- Pembelian manual paper memakai ask publik terbaru. DCA paper manual menambah kuantitas dan memperbarui harga rata-rata posisi. Keduanya **memperbarui ledger simulasi saja** dan tidak mengirim order ke Indodax.
+- Tabel posisi menampilkan modal masuk kumulatif per aset, dirinci menjadi nominal entry awal dan seluruh nominal DCA paper yang tercatat.
 - Tidak ada DCA otomatis atau penjualan rugi otomatis. Posisi yang rugi masuk status `SCALPING — UNDER REVIEW`.
 - Take-profit paper memakai tahap 40%–40%–20% saat sinyal melemah dan posisi masih untung setelah biaya.
 - Profit bersih paper hanya dikunci secara akuntansi 50:50 untuk BTC/ETH ketika semua posisi paper sudah tertutup. Tidak ada pembelian BTC/ETH nyata.

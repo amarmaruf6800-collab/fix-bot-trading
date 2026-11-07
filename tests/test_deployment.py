@@ -112,6 +112,68 @@ class DeploymentTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
+    def test_missing_favicon_is_handled_without_404(self) -> None:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardHandler)
+        host, port = server.server_address
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = urllib.request.Request(f"http://{host}:{port}/favicon.ico")
+            with urllib.request.urlopen(request, timeout=2) as response:
+                self.assertEqual(response.status, 204)
+                self.assertEqual(response.read(), b"")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_manual_paper_buy_and_dca_routes(self) -> None:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardHandler)
+        host, port = server.server_address
+        allowed_host = f"{host}:{port}"
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with (
+                patch("bot.BOT_ALLOWED_HOST", allowed_host),
+                patch(
+                    "bot.SERVICE.manual_paper_buy",
+                    return_value={"id": "paper123", "price": 100, "budget_idr": 500_000},
+                ) as manual_buy,
+                patch(
+                    "bot.SERVICE.manual_paper_dca",
+                    return_value={"dca_amount_idr": 250_000, "new_average_price": 90},
+                ) as manual_dca,
+            ):
+                for path, body in (
+                    (
+                        "/api/paper/manual-buy",
+                        {"pair_id": "testidr", "amount_idr": 500_000},
+                    ),
+                    (
+                        "/api/dca/manual",
+                        {"position_id": "paper123", "amount_idr": 250_000},
+                    ),
+                ):
+                    request = urllib.request.Request(
+                        f"http://{allowed_host}{path}",
+                        data=json.dumps(body).encode(),
+                        headers={
+                            "Origin": f"http://{allowed_host}",
+                            "Content-Type": "application/json",
+                        },
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=2) as response:
+                        self.assertEqual(response.status, 200)
+                        self.assertTrue(json.loads(response.read()))
+                manual_buy.assert_called_once_with("testidr", 500_000)
+                manual_dca.assert_called_once_with("paper123", 250_000)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
 
 if __name__ == "__main__":
     unittest.main()

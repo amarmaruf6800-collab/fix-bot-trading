@@ -11,7 +11,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -35,14 +35,20 @@ BOT_ALLOWED_HOST = os.environ.get(
     f"{'127.0.0.1' if BOT_HOST in {'127.0.0.1', '::1', 'localhost'} else BOT_HOST}:{BOT_PORT}",
 ).strip()
 SCAN_INTERVAL_SECONDS = 30
+PUBLIC_REQUEST_ATTEMPTS = 3
+PUBLIC_REQUEST_RETRY_DELAY_SECONDS = 0.5
 ENTRY_BUDGET_IDR = 1_500_000
-POSITION_LIMIT = 2
+AUTO_POSITION_LIMIT = 2
+MANUAL_POSITION_LIMIT = 1
+POSITION_LIMIT = AUTO_POSITION_LIMIT + MANUAL_POSITION_LIMIT
 POSITION_CAPITAL_IDR = 4_000_000
 DCA_RESERVE_PER_POSITION_IDR = 2_500_000
+DCA_RESERVE_IDR = AUTO_POSITION_LIMIT * DCA_RESERVE_PER_POSITION_IDR
 MANUAL_RESERVE_IDR = 2_000_000
 MAX_TRADING_CAPITAL_IDR = 10_000_000
 TAKER_FEE_RATE = 0.002
 MIN_ENTRY_PRICE_IDR = 50
+MAX_ENTRY_QUOTE_DEVIATION_PERCENT = 1.5
 EXCLUDED_ASSETS = {
     "BTC", "ETH", "SOL", "XRP", "BNB", "LINK", "DOT", "HYPE",
     "AAVE", "HBAR", "ALGO", "NEAR", "ONDO",
@@ -94,6 +100,23 @@ class Market:
         mid = (self.bid + self.ask) / 2
         return ((self.ask - self.bid) / mid) * 100 if mid else None
 
+    @property
+    def entry_quote_valid(self) -> bool:
+        if (
+            self.last <= MIN_ENTRY_PRICE_IDR
+            or self.low_24h <= 0
+            or self.high_24h < self.low_24h
+            or not self.low_24h <= self.last <= self.high_24h
+            or self.ask < self.low_24h
+        ):
+            return False
+        deviation = abs(self.ask / self.last - 1) * 100
+        return (
+            self.spread_percent is not None
+            and self.spread_percent <= 1.5
+            and deviation <= MAX_ENTRY_QUOTE_DEVIATION_PERCENT
+        )
+
 
 @dataclass(frozen=True)
 class Observation:
@@ -118,18 +141,52 @@ class IndodaxPublicClient:
     def __init__(self, timeout: float = 10.0) -> None:
         self.timeout = timeout
 
-    def _get_json(self, path: str) -> Any:
+    def _fetch_json(self, url: str, label: str) -> Any:
         request = urllib.request.Request(
-            f"{API_BASE}/{path}",
+            url,
             headers={"User-Agent": "IndodaxPaperScanner/1.0"},
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                if response.status != 200:
-                    raise RuntimeError(f"Indodax returned HTTP {response.status}")
-                return json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"Indodax public data request failed: {exc}") from exc
+        last_error: Exception | None = None
+        for attempt in range(PUBLIC_REQUEST_ATTEMPTS):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    if response.status != 200:
+                        raise RuntimeError(
+                            f"Indodax returned HTTP {response.status} for {label}."
+                        )
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                retryable = exc.code == 429 or 500 <= exc.code <= 599
+                if not retryable or attempt + 1 == PUBLIC_REQUEST_ATTEMPTS:
+                    raise RuntimeError(
+                        f"Indodax public data request for {label} failed "
+                        f"with HTTP {exc.code}."
+                    ) from exc
+                exc.close()
+            except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+                last_error = exc
+                if attempt + 1 == PUBLIC_REQUEST_ATTEMPTS:
+                    break
+
+            delay = PUBLIC_REQUEST_RETRY_DELAY_SECONDS * (2**attempt)
+            LOGGER.warning(
+                "Indodax public request %s failed (attempt %s/%s): %s; retrying in %.1fs",
+                label,
+                attempt + 1,
+                PUBLIC_REQUEST_ATTEMPTS,
+                last_error,
+                delay,
+            )
+            time.sleep(delay)
+
+        raise RuntimeError(
+            f"Indodax public data request for {label} failed after "
+            f"{PUBLIC_REQUEST_ATTEMPTS} attempts: {last_error}"
+        ) from last_error
+
+    def _get_json(self, path: str) -> Any:
+        return self._fetch_json(f"{API_BASE}/{path}", path)
 
     def fetch_markets(self) -> list[Market]:
         pairs = self._get_json("pairs")
@@ -187,17 +244,10 @@ class IndodaxPublicClient:
                 "to": end,
             }
         )
-        request = urllib.request.Request(
+        payload = self._fetch_json(
             f"https://indodax.com/tradingview/history_v2?{query}",
-            headers={"User-Agent": "IndodaxPaperScanner/1.0"},
+            f"OHLC {pair_id} {timeframe}",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                if response.status != 200:
-                    raise RuntimeError(f"Indodax returned HTTP {response.status}")
-                payload = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"Indodax OHLC request failed: {exc}") from exc
         if not isinstance(payload, list):
             raise RuntimeError(f"Unexpected OHLC response for {pair_id} {timeframe}.")
 
@@ -270,7 +320,13 @@ class PaperPortfolio:
                     tp_stage INTEGER NOT NULL DEFAULT 0,
                     current_price REAL NOT NULL,
                     under_review INTEGER NOT NULL DEFAULT 0,
-                    last_drawdown_alert INTEGER NOT NULL DEFAULT 0
+                    last_drawdown_alert INTEGER NOT NULL DEFAULT 0,
+                    funding_source TEXT NOT NULL DEFAULT 'AUTO',
+                    auto_funded_cost_idr REAL NOT NULL DEFAULT 0,
+                    dca_funded_cost_idr REAL NOT NULL DEFAULT 0,
+                    manual_funded_cost_idr REAL NOT NULL DEFAULT 0,
+                    entry_amount_idr REAL NOT NULL DEFAULT 0,
+                    dca_total_idr REAL NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -293,9 +349,82 @@ class PaperPortfolio:
                     "ALTER TABLE positions ADD COLUMN last_drawdown_alert "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
+            for column, definition in (
+                ("funding_source", "TEXT NOT NULL DEFAULT 'AUTO'"),
+                ("auto_funded_cost_idr", "REAL NOT NULL DEFAULT 0"),
+                ("dca_funded_cost_idr", "REAL NOT NULL DEFAULT 0"),
+                ("manual_funded_cost_idr", "REAL NOT NULL DEFAULT 0"),
+                ("entry_amount_idr", "REAL NOT NULL DEFAULT 0"),
+                ("dca_total_idr", "REAL NOT NULL DEFAULT 0"),
+            ):
+                if column not in position_columns:
+                    connection.execute(
+                        f"ALTER TABLE positions ADD COLUMN {column} {definition}"
+                    )
+            connection.execute(
+                """
+                UPDATE positions
+                SET auto_funded_cost_idr=cost_idr
+                WHERE auto_funded_cost_idr=0
+                  AND dca_funded_cost_idr=0
+                  AND manual_funded_cost_idr=0
+                  AND cost_idr>0
+                """
+            )
+            positions_to_migrate = connection.execute(
+                """
+                SELECT id, cost_idr, auto_funded_cost_idr,
+                       dca_funded_cost_idr, manual_funded_cost_idr
+                FROM positions
+                WHERE entry_amount_idr=0 AND dca_total_idr=0
+                """
+            ).fetchall()
+            if positions_to_migrate:
+                position_ids = {row["id"] for row in positions_to_migrate}
+                historical_amounts = {
+                    position_id: {"entry": 0.0, "dca": 0.0}
+                    for position_id in position_ids
+                }
+                for event in connection.execute(
+                    """
+                    SELECT event_type, detail FROM events
+                    WHERE event_type IN (
+                        'PAPER_ENTRY', 'MANUAL_PAPER_BUY', 'MANUAL_PAPER_DCA'
+                    )
+                    """
+                ):
+                    detail = json.loads(event["detail"])
+                    position_id = detail.get("position_id")
+                    if position_id not in historical_amounts:
+                        continue
+                    if event["event_type"] == "MANUAL_PAPER_DCA":
+                        historical_amounts[position_id]["dca"] += number(
+                            detail.get("amount_idr")
+                        )
+                    else:
+                        historical_amounts[position_id]["entry"] += number(
+                            detail.get("budget_idr_including_fee")
+                        )
+                for row in positions_to_migrate:
+                    history = historical_amounts[row["id"]]
+                    entry_amount = history["entry"] or (
+                        row["auto_funded_cost_idr"]
+                        + row["manual_funded_cost_idr"]
+                    )
+                    dca_total = history["dca"] or row["dca_funded_cost_idr"]
+                    connection.execute(
+                        """
+                        UPDATE positions
+                        SET entry_amount_idr=?, dca_total_idr=?
+                        WHERE id=?
+                        """,
+                        (entry_amount, dca_total, row["id"]),
+                    )
             defaults = {
                 "trade_cash_idr": str(MAX_TRADING_CAPITAL_IDR - MANUAL_RESERVE_IDR),
                 "realized_since_lock_idr": "0",
+                "dca_spent_idr": "0",
+                "manual_cash_idr": str(MANUAL_RESERVE_IDR),
                 "locked_profit_idr": "0",
                 "locked_btc_idr": "0",
                 "locked_eth_idr": "0",
@@ -348,17 +477,41 @@ class PaperPortfolio:
             (now_iso(), event_type, symbol, json.dumps(detail, ensure_ascii=True)),
         )
 
-    def open_position(self, market: Market, score: float) -> dict[str, Any]:
+    def _open_position(
+        self,
+        market: Market,
+        budget_idr: float,
+        *,
+        funding_source: str,
+        score: float | None = None,
+    ) -> dict[str, Any]:
+        if market.asset in EXCLUDED_ASSETS:
+            raise ValueError("Aset ini masuk daftar larangan entry.")
         if not market.active or market.last <= MIN_ENTRY_PRICE_IDR:
             raise ValueError("Market tidak aktif atau harga tidak memenuhi batas minimum.")
-        if market.spread_percent is None or market.spread_percent > 1.5:
-            raise ValueError("Spread tidak dapat diverifikasi atau lebih dari 1,5%.")
+        if not market.entry_quote_valid:
+            raise ValueError(
+                "Harga ask tidak konsisten dengan harga terakhir/rentang 24 jam; entry diblokir."
+            )
+        if not math.isfinite(budget_idr) or budget_idr <= 0:
+            raise ValueError("Nominal beli harus lebih besar dari nol.")
         with self._lock, self._connect() as connection:
             open_count = connection.execute(
                 "SELECT COUNT(*) FROM positions WHERE status='OPEN'"
             ).fetchone()[0]
-            if open_count >= POSITION_LIMIT:
-                raise ValueError("Batas maksimal dua posisi aktif telah tercapai.")
+            source_count = connection.execute(
+                "SELECT COUNT(*) FROM positions WHERE status='OPEN' AND funding_source=?",
+                (funding_source,),
+            ).fetchone()[0]
+            source_limit = (
+                AUTO_POSITION_LIMIT
+                if funding_source == "AUTO"
+                else MANUAL_POSITION_LIMIT
+            )
+            if open_count >= POSITION_LIMIT or source_count >= source_limit:
+                raise ValueError(
+                    "Batas slot posisi otomatis/manual telah tercapai."
+                )
             if connection.execute(
                 "SELECT 1 FROM positions WHERE status='OPEN' AND pair_id=?",
                 (market.pair_id,),
@@ -366,16 +519,27 @@ class PaperPortfolio:
                 raise ValueError("Posisi paper untuk aset ini sudah terbuka.")
 
             trade_cash = self._setting(connection, "trade_cash_idr")
-            reserved_dca = POSITION_LIMIT * DCA_RESERVE_PER_POSITION_IDR
-            required_entry_and_reserve = reserved_dca + ENTRY_BUDGET_IDR
-            if trade_cash < required_entry_and_reserve:
-                raise ValueError("Anggaran entry khusus tidak tersedia setelah dana terkunci.")
+            manual_cash = self._setting(connection, "manual_cash_idr")
+            dca_available = min(
+                max(0.0, DCA_RESERVE_IDR - self._setting(connection, "dca_spent_idr")),
+                trade_cash,
+            )
+            if funding_source == "AUTO":
+                if trade_cash - dca_available < budget_idr:
+                    raise ValueError(
+                        "Kas entry otomatis tidak cukup setelah cadangan DCA dikunci."
+                    )
+            elif funding_source == "MANUAL":
+                if manual_cash < budget_idr:
+                    raise ValueError("Cadangan manual tidak cukup untuk nominal tersebut.")
+            else:
+                raise ValueError("Sumber dana posisi paper tidak dikenal.")
 
-            gross_order_value = ENTRY_BUDGET_IDR / (1 + TAKER_FEE_RATE)
-            entry_fee = ENTRY_BUDGET_IDR - gross_order_value
+            gross_order_value = budget_idr / (1 + TAKER_FEE_RATE)
+            entry_fee = budget_idr - gross_order_value
             quantity = gross_order_value / market.ask
-            if quantity * market.ask + entry_fee > ENTRY_BUDGET_IDR + 0.01:
-                raise ValueError("Biaya membuat debit melampaui anggaran entry.")
+            if quantity * market.ask + entry_fee > budget_idr + 0.01:
+                raise ValueError("Biaya membuat debit melampaui nominal beli.")
 
             position_id = uuid.uuid4().hex[:12]
             connection.execute(
@@ -383,8 +547,10 @@ class PaperPortfolio:
                 INSERT INTO positions(
                     id, pair_id, symbol, asset, entry_price, average_price,
                     original_quantity, quantity, cost_idr, entered_at, status,
-                    current_price, under_review
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, 0)
+                    current_price, under_review, funding_source,
+                    auto_funded_cost_idr, manual_funded_cost_idr,
+                    entry_amount_idr, dca_total_idr
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, 0, ?, ?, ?, ?, 0)
                 """,
                 (
                     position_id,
@@ -395,26 +561,50 @@ class PaperPortfolio:
                     market.ask,
                     quantity,
                     quantity,
-                    ENTRY_BUDGET_IDR,
+                    budget_idr,
                     now_iso(),
                     market.last,
+                    funding_source,
+                    budget_idr if funding_source == "AUTO" else 0,
+                    budget_idr if funding_source == "MANUAL" else 0,
+                    budget_idr,
                 ),
             )
-            self._set_setting(connection, "trade_cash_idr", trade_cash - ENTRY_BUDGET_IDR)
+            if funding_source == "AUTO":
+                self._set_setting(connection, "trade_cash_idr", trade_cash - budget_idr)
+            else:
+                self._set_setting(connection, "manual_cash_idr", manual_cash - budget_idr)
             self._event(
                 connection,
-                "PAPER_ENTRY",
+                "PAPER_ENTRY" if funding_source == "AUTO" else "MANUAL_PAPER_BUY",
                 market.symbol,
                 {
                     "position_id": position_id,
-                    "score": round(score, 2),
-                    "budget_idr_including_fee": ENTRY_BUDGET_IDR,
+                    "funding_source": funding_source,
+                    "score": round(score, 2) if score is not None else None,
+                    "budget_idr_including_fee": budget_idr,
                     "price": market.ask,
                     "quantity": quantity,
                     "fee_idr": entry_fee,
                 },
             )
-            return {"id": position_id, "quantity": quantity, "price": market.ask}
+            return {
+                "id": position_id,
+                "quantity": quantity,
+                "price": market.ask,
+                "budget_idr": budget_idr,
+            }
+
+    def open_position(self, market: Market, score: float) -> dict[str, Any]:
+        return self._open_position(
+            market,
+            ENTRY_BUDGET_IDR,
+            funding_source="AUTO",
+            score=score,
+        )
+
+    def open_manual_position(self, market: Market, amount_idr: float) -> dict[str, Any]:
+        return self._open_position(market, amount_idr, funding_source="MANUAL")
 
     def update_positions(self, markets_by_pair: dict[str, Market], weak_pairs: set[str]) -> None:
         with self._lock, self._connect() as connection:
@@ -477,31 +667,26 @@ class PaperPortfolio:
         quantity = min(target_quantity, row["quantity"])
         if quantity <= 0:
             return
-        gross = quantity * price
-        fee = gross * TAKER_FEE_RATE
-        net_proceeds = gross - fee
-        allocated_cost = row["cost_idr"] * (quantity / row["quantity"])
-        realized = net_proceeds - allocated_cost
-        trade_cash = self._setting(connection, "trade_cash_idr")
-        realized_total = self._setting(connection, "realized_since_lock_idr")
+        sale = self._record_sale(connection, row, quantity, price)
         connection.execute(
             """
             UPDATE positions
             SET quantity=?, cost_idr=?, tp_stage=?,
+                auto_funded_cost_idr=?, dca_funded_cost_idr=?,
+                manual_funded_cost_idr=?,
                 status=CASE WHEN ? <= 1e-12 THEN 'CLOSED' ELSE status END
             WHERE id=?
             """,
             (
-                max(0.0, row["quantity"] - quantity),
-                max(0.0, row["cost_idr"] - allocated_cost),
+                sale["remaining_quantity"],
+                sale["remaining_cost_idr"],
                 stage + 1,
-                max(0.0, row["quantity"] - quantity),
+                sale["remaining_auto_cost_idr"],
+                sale["remaining_dca_cost_idr"],
+                sale["remaining_manual_cost_idr"],
+                sale["remaining_quantity"],
                 row["id"],
             ),
-        )
-        self._set_setting(connection, "trade_cash_idr", trade_cash + net_proceeds)
-        self._set_setting(
-            connection, "realized_since_lock_idr", realized_total + realized
         )
         self._event(
             connection,
@@ -510,11 +695,69 @@ class PaperPortfolio:
             {
                 "quantity": quantity,
                 "price": price,
-                "fee_idr": fee,
-                "realized_pnl_idr": realized,
-                "remaining_quantity": max(0.0, row["quantity"] - quantity),
+                "fee_idr": sale["fee_idr"],
+                "realized_pnl_idr": sale["realized_pnl_idr"],
+                "remaining_quantity": sale["remaining_quantity"],
             },
         )
+
+    def _record_sale(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        quantity: float,
+        price: float,
+    ) -> dict[str, float]:
+        fraction = min(1.0, quantity / row["quantity"])
+        allocated_cost = row["cost_idr"] * fraction
+        auto_cost = row["auto_funded_cost_idr"] * fraction
+        dca_cost = row["dca_funded_cost_idr"] * fraction
+        manual_cost = row["manual_funded_cost_idr"] * fraction
+        gross = quantity * price
+        fee = gross * TAKER_FEE_RATE
+        net_proceeds = gross - fee
+        if row["cost_idr"] > 0:
+            auto_proceeds = net_proceeds * row["auto_funded_cost_idr"] / row["cost_idr"]
+            dca_proceeds = net_proceeds * row["dca_funded_cost_idr"] / row["cost_idr"]
+            manual_proceeds = net_proceeds - auto_proceeds - dca_proceeds
+        else:
+            auto_proceeds = dca_proceeds = manual_proceeds = 0.0
+        manual_recovery = min(manual_proceeds, manual_cost)
+        manual_profit = max(0.0, manual_proceeds - manual_cost)
+        self._set_setting(
+            connection,
+            "trade_cash_idr",
+            self._setting(connection, "trade_cash_idr")
+            + auto_proceeds
+            + dca_proceeds
+            + manual_profit,
+        )
+        self._set_setting(
+            connection,
+            "manual_cash_idr",
+            self._setting(connection, "manual_cash_idr") + manual_recovery,
+        )
+        self._set_setting(
+            connection,
+            "dca_spent_idr",
+            max(0.0, self._setting(connection, "dca_spent_idr") - dca_proceeds),
+        )
+        realized = net_proceeds - allocated_cost
+        self._set_setting(
+            connection,
+            "realized_since_lock_idr",
+            self._setting(connection, "realized_since_lock_idr") + realized,
+        )
+        remaining_quantity = max(0.0, row["quantity"] - quantity)
+        return {
+            "fee_idr": fee,
+            "realized_pnl_idr": realized,
+            "remaining_quantity": remaining_quantity,
+            "remaining_cost_idr": max(0.0, row["cost_idr"] - allocated_cost),
+            "remaining_auto_cost_idr": max(0.0, row["auto_funded_cost_idr"] - auto_cost),
+            "remaining_dca_cost_idr": max(0.0, row["dca_funded_cost_idr"] - dca_cost),
+            "remaining_manual_cost_idr": max(0.0, row["manual_funded_cost_idr"] - manual_cost),
+        }
 
     def manual_paper_sell(self, position_id: str, price: float) -> None:
         if price <= 0:
@@ -525,25 +768,26 @@ class PaperPortfolio:
             ).fetchone()
             if row is None:
                 raise ValueError("Posisi paper tidak ditemukan atau sudah ditutup.")
-            gross = row["quantity"] * price
-            fee = gross * TAKER_FEE_RATE
-            proceeds = gross - fee
-            realized = proceeds - row["cost_idr"]
-            cash = self._setting(connection, "trade_cash_idr")
-            realized_total = self._setting(connection, "realized_since_lock_idr")
+            sale = self._record_sale(connection, row, row["quantity"], price)
             connection.execute(
-                "UPDATE positions SET quantity=0, cost_idr=0, status='CLOSED' WHERE id=?",
+                """
+                UPDATE positions
+                SET quantity=0, cost_idr=0, auto_funded_cost_idr=0,
+                    dca_funded_cost_idr=0, manual_funded_cost_idr=0,
+                    status='CLOSED'
+                WHERE id=?
+                """,
                 (position_id,),
-            )
-            self._set_setting(connection, "trade_cash_idr", cash + proceeds)
-            self._set_setting(
-                connection, "realized_since_lock_idr", realized_total + realized
             )
             self._event(
                 connection,
                 "MANUAL_PAPER_SELL",
                 row["symbol"],
-                {"price": price, "fee_idr": fee, "realized_pnl_idr": realized},
+                {
+                    "price": price,
+                    "fee_idr": sale["fee_idr"],
+                    "realized_pnl_idr": sale["realized_pnl_idr"],
+                },
             )
             self._lock_realized_profit_if_ready(connection)
 
@@ -558,10 +802,17 @@ class PaperPortfolio:
             return
         total_to_lock = realized
         cash = self._setting(connection, "trade_cash_idr")
-        if cash - total_to_lock < 0:
+        manual_cash = self._setting(connection, "manual_cash_idr")
+        if cash + manual_cash < total_to_lock:
             raise RuntimeError("Profit lock gagal: saldo paper tidak mencukupi.")
         half = total_to_lock / 2
-        self._set_setting(connection, "trade_cash_idr", cash - total_to_lock)
+        cash_lock = min(cash, total_to_lock)
+        self._set_setting(connection, "trade_cash_idr", cash - cash_lock)
+        self._set_setting(
+            connection,
+            "manual_cash_idr",
+            manual_cash - (total_to_lock - cash_lock),
+        )
         self._set_setting(
             connection,
             "locked_profit_idr",
@@ -606,11 +857,21 @@ class PaperPortfolio:
             "original_quantity": row["original_quantity"],
             "quantity": row["quantity"],
             "cost_idr": row["cost_idr"],
+            "entry_amount_idr": row["entry_amount_idr"],
+            "dca_total_idr": row["dca_total_idr"],
+            "total_invested_idr": (
+                row["entry_amount_idr"] + row["dca_total_idr"]
+            ),
             "unrealized_pnl_idr": pnl,
             "unrealized_pnl_percent": (
                 pnl / row["cost_idr"] * 100 if row["cost_idr"] else 0
             ),
-            "status": "SCALPING — UNDER REVIEW" if row["under_review"] else row["status"],
+            "status": (
+                "SCALPING — UNDER REVIEW"
+                if row["status"] == "OPEN" and row["under_review"]
+                else row["status"]
+            ),
+            "funding_source": row["funding_source"],
             "tp_stage": row["tp_stage"],
             "entered_at": row["entered_at"],
         }
@@ -625,16 +886,24 @@ class PaperPortfolio:
             ).fetchall()
             cash = self._setting(connection, "trade_cash_idr")
             locked = self._setting(connection, "locked_profit_idr")
+            manual_cash = self._setting(connection, "manual_cash_idr")
+            dca_available = min(
+                max(0.0, DCA_RESERVE_IDR - self._setting(connection, "dca_spent_idr")),
+                cash,
+            )
             open_positions = [
                 row for row in position_rows if row["status"] == "OPEN"
             ]
-            free_slots = max(0, POSITION_LIMIT - len(open_positions))
+            auto_open_count = sum(
+                row["funding_source"] == "AUTO" for row in open_positions
+            )
+            free_slots = max(0, AUTO_POSITION_LIMIT - auto_open_count)
             entry_capacity = min(
                 free_slots,
                 int(
                     max(
                         0.0,
-                        cash - POSITION_LIMIT * DCA_RESERVE_PER_POSITION_IDR,
+                            cash - dca_available,
                     )
                     // ENTRY_BUDGET_IDR
                 ),
@@ -646,11 +915,11 @@ class PaperPortfolio:
             return {
                 "mode": "PAPER ONLY — NO LIVE ORDERS",
                 "balances": {
-                    "virtual_total_idr": cash + invested_value + MANUAL_RESERVE_IDR + locked,
+                    "virtual_total_idr": cash + manual_cash + invested_value + locked,
                     "trade_cash_idr": cash,
                     "available_entry_capacity_idr": entry_capacity,
-                    "manual_reserve_locked_idr": MANUAL_RESERVE_IDR,
-                    "dca_reserve_locked_idr": DCA_RESERVE_PER_POSITION_IDR * POSITION_LIMIT,
+                    "manual_reserve_available_idr": manual_cash,
+                    "dca_reserve_available_idr": dca_available,
                     "entry_budget_per_position_idr": ENTRY_BUDGET_IDR,
                     "locked_profit_idr": locked,
                     "locked_btc_idr": self._setting(connection, "locked_btc_idr"),
@@ -676,37 +945,95 @@ class PaperPortfolio:
                 "scanner_running": bool(self._setting(connection, "scanner_running")),
             }
 
-    def simulate_dca(
+    def manual_dca(
         self, position_id: str, dca_amount: float, dca_price: float
     ) -> dict[str, float]:
-        if dca_amount <= 0 or dca_price <= 0:
-            raise ValueError("Nominal DCA dan harga harus lebih besar dari nol.")
-        if dca_amount > DCA_RESERVE_PER_POSITION_IDR:
-            raise ValueError("Nominal melebihi cadangan DCA maksimum per posisi.")
-        with self._connect() as connection:
+        if (
+            not math.isfinite(dca_amount)
+            or not math.isfinite(dca_price)
+            or dca_amount <= 0
+            or dca_price <= MIN_ENTRY_PRICE_IDR
+        ):
+            raise ValueError("Nominal DCA dan harga aset harus valid; harga wajib di atas Rp50.")
+        with self._lock, self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM positions WHERE id=? AND status='OPEN'", (position_id,)
             ).fetchone()
-        if row is None:
-            raise ValueError("Pilih posisi paper yang masih terbuka.")
-        existing_cost = row["cost_idr"]
-        new_quantity = dca_amount / (1 + TAKER_FEE_RATE) / dca_price
-        fee = dca_amount - (new_quantity * dca_price)
-        total_cost = existing_cost + dca_amount
-        total_quantity = row["quantity"] + new_quantity
-        average = total_cost / total_quantity if total_quantity else 0
+            if row is None:
+                raise ValueError("Pilih posisi paper yang masih terbuka.")
+            if row["asset"] in EXCLUDED_ASSETS:
+                raise ValueError("DCA untuk aset yang dilarang tidak diizinkan.")
+            trade_cash = self._setting(connection, "trade_cash_idr")
+            dca_spent = self._setting(connection, "dca_spent_idr")
+            dca_available = min(max(0.0, DCA_RESERVE_IDR - dca_spent), trade_cash)
+            manual_cash = self._setting(connection, "manual_cash_idr")
+            if dca_amount > dca_available + manual_cash:
+                raise ValueError("Cadangan DCA dan manual tidak cukup untuk nominal tersebut.")
+
+            dca_funding = min(dca_amount, dca_available)
+            manual_funding = dca_amount - dca_funding
+            new_quantity = dca_amount / (1 + TAKER_FEE_RATE) / dca_price
+            new_cost = row["cost_idr"] + dca_amount
+            total_quantity = row["quantity"] + new_quantity
+            average = new_cost / total_quantity if total_quantity else 0
+            pnl_percent = (
+                (dca_price * total_quantity * (1 - TAKER_FEE_RATE) / new_cost) - 1
+            ) * 100
+            connection.execute(
+                """
+                UPDATE positions
+                SET average_price=?, original_quantity=original_quantity+?,
+                    quantity=?, cost_idr=?, current_price=?, under_review=?
+                    , dca_funded_cost_idr=dca_funded_cost_idr+?,
+                    manual_funded_cost_idr=manual_funded_cost_idr+?,
+                    dca_total_idr=dca_total_idr+?
+                WHERE id=?
+                """,
+                (
+                    average,
+                    new_quantity,
+                    total_quantity,
+                    new_cost,
+                    dca_price,
+                    int(pnl_percent < 0),
+                    dca_funding,
+                    manual_funding,
+                    dca_amount,
+                    position_id,
+                ),
+            )
+            self._set_setting(connection, "trade_cash_idr", trade_cash - dca_funding)
+            self._set_setting(connection, "dca_spent_idr", dca_spent + dca_funding)
+            self._set_setting(connection, "manual_cash_idr", manual_cash - manual_funding)
+            fee = dca_amount - (new_quantity * dca_price)
+            self._event(
+                connection,
+                "MANUAL_PAPER_DCA",
+                row["symbol"],
+                {
+                    "position_id": position_id,
+                    "amount_idr": dca_amount,
+                    "price": dca_price,
+                    "quantity_added": new_quantity,
+                    "fee_idr": fee,
+                    "dca_reserve_used_idr": dca_funding,
+                    "manual_reserve_used_idr": manual_funding,
+                    "new_average_price": average,
+                },
+            )
         break_even = average / (1 - TAKER_FEE_RATE)
         return {
-            "simulated_dca_amount_idr": dca_amount,
-            "simulated_dca_fee_idr": fee,
+            "dca_amount_idr": dca_amount,
+            "dca_fee_idr": fee,
             "new_average_price": average,
-            "estimated_total_cost_idr": total_cost,
+            "estimated_total_cost_idr": new_cost,
             "break_even_after_fees": break_even,
             "loss_if_price_falls_10_percent_idr": (
                 total_quantity * break_even * 0.9 * (1 - TAKER_FEE_RATE)
-            ) - total_cost,
-            "dca_reserve_remaining_idr": DCA_RESERVE_PER_POSITION_IDR - dca_amount,
-            "note": "SIMULASI SAJA — tidak mengubah posisi atau mengirim order.",
+            ) - new_cost,
+            "dca_reserve_remaining_idr": max(0.0, dca_available - dca_funding),
+            "manual_reserve_remaining_idr": manual_cash - manual_funding,
+            "note": "DCA paper dicatat dan saldo simulasi diperbarui; tidak mengirim order live.",
         }
 
 
@@ -765,13 +1092,9 @@ def analyze_candles(candles: list[Candle]) -> dict[str, Any]:
         candles[-1].volume / median_volume if median_volume > 0 else None
     )
     previous_close = candles[-2].close if len(candles) >= 2 else None
-    five_minute_close = candles[-6].close if len(candles) >= 6 else None
     close = candles[-1].close
-    change_1m = (
+    change_previous_candle = (
         (close / previous_close - 1) * 100 if previous_close else None
-    )
-    change_5m = (
-        (close / five_minute_close - 1) * 100 if five_minute_close else None
     )
     failed_breakout = bool(
         resistance is not None
@@ -789,8 +1112,7 @@ def analyze_candles(candles: list[Candle]) -> dict[str, Any]:
         "candles": len(candles),
         "latest_timestamp": candles[-1].timestamp,
         "latest_close": close,
-        "change_1m_percent": change_1m,
-        "change_5m_percent": change_5m,
+        "change_previous_candle_percent": change_previous_candle,
         "ema_9": ema_9,
         "ema_21": ema_21,
         "ema_bullish": ema_9 > ema_21 if ema_9 is not None and ema_21 is not None else None,
@@ -817,8 +1139,9 @@ class MarketScanner:
         now = timestamp if timestamp is not None else time.time()
         signals: list[dict[str, Any]] = []
         with self._lock:
+            self._signals.clear()
             for market in markets:
-                if market.last <= 0:
+                if market.last <= MIN_ENTRY_PRICE_IDR:
                     continue
                 history = self._history[market.pair_id]
                 history.append(Observation(now, market.last, market.volume_idr_24h))
@@ -836,19 +1159,14 @@ class MarketScanner:
                         return None
                     return (market.last / old.price - 1) * 100
 
-                m1 = change(60)
-                m5 = change(300)
                 m15 = change(900)
                 h1 = change(3600)
                 h4 = change(14_400)
-                d1 = change(86_400)
                 score = 0.0
-                if m1 is not None:
-                    score += max(-2, min(2, m1 * 1.5))
-                if m5 is not None:
-                    score += max(-3, min(3, m5))
                 if m15 is not None:
-                    score += max(-2, min(2, m15 * 0.4))
+                    score += max(-3, min(3, m15))
+                if h1 is not None:
+                    score += max(-2, min(2, h1 * 0.4))
                 if market.volume_idr_24h >= 25_000_000:
                     score += 1
                 if market.spread_percent is not None and market.spread_percent <= 0.5:
@@ -866,13 +1184,9 @@ class MarketScanner:
                     and market.asset not in EXCLUDED_ASSETS
                     and market.last > MIN_ENTRY_PRICE_IDR
                     and market.volume_idr_24h >= 10_000_000
-                    and market.spread_percent is not None
-                    and market.spread_percent <= 1.5
+                    and market.entry_quote_valid
                 )
-                early_momentum = (
-                    (m1 is not None and m1 >= 0.35)
-                    or (m5 is not None and m5 >= 0.8)
-                )
+                early_momentum = m15 is not None and m15 >= 0.8
                 if not eligible:
                     status = "FILTERED"
                 elif not early_momentum:
@@ -890,8 +1204,7 @@ class MarketScanner:
                     "volume_idr_24h": market.volume_idr_24h,
                     "daily_range_percent": daily_range_percent,
                     "changes_percent": {
-                        "1m": m1, "5m": m5, "15m": m15,
-                        "1h": h1, "4h": h4, "1d": d1,
+                        "15m": m15, "1h": h1, "4h": h4,
                     },
                     "score": round(score, 2),
                     "status": status,
@@ -927,51 +1240,47 @@ class MarketScanner:
                         signal["status"] = "WAITING TECHNICAL CHECK"
                     continue
                 signal["technical"] = context
-                one_minute = context["1m"]
-                change_1m = one_minute["change_1m_percent"]
-                change_5m = one_minute["change_5m_percent"]
-                early_momentum = (
-                    (change_1m is not None and change_1m >= 0.35)
-                    or (change_5m is not None and change_5m >= 0.8)
-                )
                 structure = context["15m"]
+                candle_momentum = structure["change_previous_candle_percent"]
+                signal["early_momentum"] = (
+                    candle_momentum is not None and candle_momentum >= 0.8
+                )
+                trend_1h = context["1h"]["ema_bullish"] is True
+                trend_4h = context["4h"]["ema_bullish"] is True
                 room = structure["room_to_resistance_percent"]
                 blocked_by_resistance = (
                     room is not None and 0 <= room < 1.0
                 )
                 enough_data = (
-                    one_minute["candles"] >= 22
-                    and structure["candles"] >= 22
+                    structure["candles"] >= 22
                     and context["1h"]["candles"] >= 22
                     and context["4h"]["candles"] >= 22
-                    and context["1d"]["candles"] >= 22
                 )
                 now = time.time()
                 freshness_limits = {
-                    "1m": 180,
                     "15m": 1_800,
                     "1h": 7_200,
                     "4h": 28_800,
-                    "1d": 172_800,
                 }
                 fresh_data = all(
                     0 <= now - context[timeframe]["latest_timestamp"] <= max_age
                     for timeframe, max_age in freshness_limits.items()
                 )
                 price_deviation = (
-                    abs(signal["price_idr"] / one_minute["latest_close"] - 1) * 100
-                    if one_minute["latest_close"] > 0
+                    abs(signal["price_idr"] / structure["latest_close"] - 1) * 100
+                    if structure["latest_close"] > 0
                     else float("inf")
                 )
                 price_data_coherent = price_deviation <= 1.5
                 signal["technical_fresh"] = fresh_data and price_data_coherent
-                signal["early_momentum"] = early_momentum
                 signal["entry_ready"] = (
                     signal["eligible"]
-                    and early_momentum
+                    and signal["early_momentum"]
                     and enough_data
                     and fresh_data
                     and price_data_coherent
+                    and trend_1h
+                    and trend_4h
                     and not structure["failed_breakout"]
                     and not blocked_by_resistance
                 )
@@ -981,6 +1290,10 @@ class MarketScanner:
                     signal["status"] = "INSUFFICIENT OHLC HISTORY"
                 elif not fresh_data or not price_data_coherent:
                     signal["status"] = "STALE OR INCONSISTENT DATA"
+                elif not trend_1h or not trend_4h:
+                    signal["status"] = "1H/4H TREND NOT CONFIRMED"
+                elif not signal["early_momentum"]:
+                    signal["status"] = "15M MOMENTUM NOT CONFIRMED"
                 elif structure["failed_breakout"]:
                     signal["status"] = "POSSIBLE FALSE BREAKOUT"
                 elif blocked_by_resistance:
@@ -999,26 +1312,26 @@ class MarketScanner:
                 technical = signal["technical"]
                 if technical is None or not signal["technical_fresh"]:
                     continue
-                short = technical["1m"]["change_5m_percent"]
-                minute = technical["1m"]["change_1m_percent"]
                 structure = technical["15m"]
+                changes = signal["changes_percent"]
+                change_15m = changes["15m"]
+                change_1h = changes["1h"]
                 sustained_weakness = (
-                    short is not None
-                    and short <= -0.5
-                    and minute is not None
-                    and minute <= -0.2
+                    change_15m is not None
+                    and change_15m <= -0.5
+                    and change_1h is not None
+                    and change_1h < 0
                 )
                 failed_breakout = (
                     structure["failed_breakout"]
-                    and short is not None
-                    and short < 0
+                    and change_15m is not None
+                    and change_15m < 0
                 )
                 trend_reversal = (
                     structure["ema_bullish"] is False
-                    and short is not None
-                    and short < 0
-                    and minute is not None
-                    and minute < 0
+                    and technical["1h"]["ema_bullish"] is False
+                    and change_15m is not None
+                    and change_15m < 0
                 )
                 if sustained_weakness or failed_breakout or trend_reversal:
                     weak.add(pair_id)
@@ -1040,13 +1353,19 @@ class BotService:
         self._signals: list[dict[str, Any]] = []
         self._error: str | None = None
         self._last_scan: str | None = None
+        self._last_scan_monotonic: float | None = None
+        self._scan_status = "Belum dimulai"
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self.portfolio.set_setting("scanner_running", 0)
 
     def scan_once(self) -> list[dict[str, Any]]:
+        with self._lock:
+            self._scan_status = "Mengambil ticker publik Indodax..."
         markets = self.client.fetch_markets()
         signals = self.scanner.analyze(markets)
+        with self._lock:
+            self._scan_status = f"Menganalisis {len(markets)} pasar..."
         market_map = {market.pair_id: market for market in markets}
         open_pairs = self.portfolio.open_pair_ids()
         candidate_by_pair = {
@@ -1064,14 +1383,16 @@ class BotService:
         )[:6]:
             candidate_by_pair.setdefault(signal["pair_id"], signal)
         candidates = list(candidate_by_pair.values())
+        with self._lock:
+            self._scan_status = (
+                f"Mengambil candle 15m/1j/4j untuk {len(candidates)} kandidat..."
+            )
         technical_by_pair: dict[str, dict[str, Any]] = {}
         errors_by_pair: dict[str, str] = {}
         timeframe_map = {
-            "1m": "1",
             "15m": "15",
             "1h": "60",
             "4h": "240",
-            "1d": "1D",
         }
         for signal in candidates:
             try:
@@ -1095,22 +1416,73 @@ class BotService:
         self.scanner.attach_technicals(signals, technical_by_pair, errors_by_pair)
         self.portfolio.update_positions(market_map, self.scanner.weak_pairs())
         if self.portfolio.get_setting("auto_paper_entry"):
-            for signal in signals:
-                if not signal["entry_ready"]:
-                    continue
-                market = market_map[signal["pair_id"]]
-                try:
-                    self.portfolio.open_position(market, signal["score"])
-                except ValueError as exc:
-                    LOGGER.info("Paper entry skipped for %s: %s", market.symbol, exc)
-                    continue
-                break
+            self.open_ready_auto_positions(signals, market_map)
         with self._lock:
             self._markets = market_map
             self._signals = signals
             self._error = None
             self._last_scan = now_iso()
+            self._last_scan_monotonic = time.monotonic()
+            ready_count = sum(signal["entry_ready"] for signal in signals)
+            eligible_signals = [
+                signal for signal in signals if signal["eligible"]
+            ]
+            blocker_summary = ", ".join(
+                f"{status} ({count})"
+                for status, count in Counter(
+                    signal["status"]
+                    for signal in eligible_signals
+                    if not signal["entry_ready"]
+                ).most_common(3)
+            )
+            auto_enabled = bool(self.portfolio.get_setting("auto_paper_entry"))
+            self._scan_status = (
+                f"Selesai: {len(markets)} pasar, {len(eligible_signals)} lolos filter, "
+                f"{len(candidates)} kandidat OHLC, {ready_count} siap entry; "
+                f"otomatis {'aktif' if auto_enabled else 'nonaktif'}."
+            )
+            if blocker_summary:
+                self._scan_status += f" Penghambat: {blocker_summary}."
+            elif not eligible_signals:
+                self._scan_status += (
+                    " Belum ada aset yang lolos filter harga, volume, spread, dan quote."
+                )
+        LOGGER.info("Market scan completed: %s", self._scan_status)
         return signals
+
+    def open_ready_auto_positions(
+        self,
+        signals: list[dict[str, Any]],
+        markets_by_pair: dict[str, Market],
+    ) -> int:
+        opened_count = 0
+        current_auto_count = sum(
+            1
+            for position in self.portfolio.state({})["positions"]
+            if position["status"] == "OPEN"
+            and position["funding_source"] == "AUTO"
+        )
+        slots_available = max(0, AUTO_POSITION_LIMIT - current_auto_count)
+        for signal in signals:
+            if opened_count >= slots_available:
+                break
+            if not signal["entry_ready"]:
+                continue
+            market = markets_by_pair.get(signal["pair_id"])
+            if market is None:
+                continue
+            try:
+                self.portfolio.open_position(market, signal["score"])
+            except ValueError as exc:
+                LOGGER.info("Paper entry skipped for %s: %s", market.symbol, exc)
+                continue
+            LOGGER.info(
+                "Automatic paper position opened for %s at ask %.12g",
+                market.symbol,
+                market.ask,
+            )
+            opened_count += 1
+        return opened_count
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -1120,6 +1492,7 @@ class BotService:
                 LOGGER.exception("Market scan failed")
                 with self._lock:
                     self._error = str(exc)
+                    self._scan_status = f"Gagal: {exc}"
             self._stop.wait(SCAN_INTERVAL_SECONDS)
         self.portfolio.set_setting("scanner_running", 0)
 
@@ -1129,6 +1502,7 @@ class BotService:
                 return
             self._stop.clear()
             self.portfolio.set_setting("scanner_running", 1)
+            self._scan_status = "Scanner dimulai."
             self._thread = threading.Thread(
                 target=self._run, name="indodax-paper-scanner", daemon=True
             )
@@ -1144,24 +1518,86 @@ class BotService:
             signals = list(self._signals)
             error = self._error
             last_scan = self._last_scan
+            scan_status = self._scan_status
+            scan_is_fresh = (
+                self._last_scan_monotonic is not None
+                and time.monotonic() - self._last_scan_monotonic <= 60
+            )
         portfolio = self.portfolio.state(market_map)
         positions = [position for position in portfolio["positions"] if position["status"] != "CLOSED"]
+        open_positions = [
+            position for position in positions if position["status"] != "CLOSED"
+        ]
         return {
             **portfolio,
             "positions": positions,
+            "position_slots": {
+                "automatic_open": sum(
+                    position["funding_source"] == "AUTO"
+                    for position in open_positions
+                ),
+                "automatic_limit": AUTO_POSITION_LIMIT,
+                "manual_open": sum(
+                    position["funding_source"] == "MANUAL"
+                    for position in open_positions
+                ),
+                "manual_limit": MANUAL_POSITION_LIMIT,
+            },
             "markets_scanned": len(market_map),
             "signals": signals[:40],
+            "manual_market_options": [
+                {
+                    "pair_id": market.pair_id,
+                    "symbol": market.symbol,
+                    "price_idr": market.last,
+                    "ask_idr": market.ask,
+                }
+                for market in market_map.values()
+                if scan_is_fresh
+                and market.active
+                and market.asset not in EXCLUDED_ASSETS
+                and market.entry_quote_valid
+            ],
             "last_scan": last_scan,
+            "scan_status": scan_status,
             "error": error,
             "scan_interval_seconds": SCAN_INTERVAL_SECONDS,
         }
 
-    def dca_simulation(self, data: dict[str, Any]) -> dict[str, Any]:
-        return self.portfolio.simulate_dca(
-            str(data.get("position_id", "")),
-            number(data.get("amount_idr")),
-            number(data.get("price_idr")),
-        )
+    def manual_paper_buy(self, pair_id: str, amount_idr: float) -> dict[str, Any]:
+        with self._lock:
+            if (
+                self._last_scan_monotonic is None
+                or time.monotonic() - self._last_scan_monotonic > 60
+            ):
+                raise ValueError("Data pasar belum tersedia atau sudah kedaluwarsa. Jalankan scanner.")
+            market = self._markets.get(pair_id)
+        if (
+            market is None
+            or not market.entry_quote_valid
+            or market.asset in EXCLUDED_ASSETS
+        ):
+            raise ValueError(
+                "Aset tidak tersedia, berharga Rp50 ke bawah, atau harga ask tidak konsisten."
+            )
+        return self.portfolio.open_manual_position(market, amount_idr)
+
+    def manual_paper_dca(
+        self, position_id: str, amount_idr: float
+    ) -> dict[str, float]:
+        pair_id = self._position_pair(position_id)
+        if pair_id is None:
+            raise ValueError("Posisi paper tidak ditemukan.")
+        with self._lock:
+            if (
+                self._last_scan_monotonic is None
+                or time.monotonic() - self._last_scan_monotonic > 60
+            ):
+                raise ValueError("Data pasar belum tersedia atau sudah kedaluwarsa. Jalankan scanner.")
+            market = self._markets.get(pair_id)
+        if market is None or not market.entry_quote_valid:
+            raise ValueError("Harga aset terbaru tidak tersedia atau Rp50 ke bawah.")
+        return self.portfolio.manual_dca(position_id, amount_idr, market.ask)
 
     def private_api_preflight(self) -> dict[str, Any]:
         credentials = IndodaxCredentials.from_environment()
@@ -1264,6 +1700,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/favicon.ico":
+            self._send(204, b"", "image/x-icon")
+            return
         if parsed.path == "/":
             try:
                 self._send(200, INDEX_FILE.read_bytes(), "text/html; charset=utf-8")
@@ -1330,8 +1769,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 SERVICE.portfolio.set_setting("auto_paper_entry", int(enabled))
                 self._json(200, {"ok": True, "enabled": enabled})
                 return
-            if parsed.path == "/api/dca/simulate":
-                self._json(200, SERVICE.dca_simulation(data))
+            if parsed.path == "/api/dca/manual":
+                result = SERVICE.manual_paper_dca(
+                    str(data.get("position_id", "")),
+                    number(data.get("amount_idr")),
+                )
+                self._json(200, result)
+                return
+            if parsed.path == "/api/paper/manual-buy":
+                result = SERVICE.manual_paper_buy(
+                    str(data.get("pair_id", "")),
+                    number(data.get("amount_idr")),
+                )
+                self._json(200, result)
                 return
             if parsed.path == "/api/exchange/preflight":
                 if not is_loopback_client(self.client_address[0]):
